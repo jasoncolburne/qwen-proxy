@@ -235,16 +235,82 @@ fn tokenize_len(tokenizer: &Tokenizer, text: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn openai_messages_text(openai_req: &Value) -> String {
-    let mut out = String::new();
-    if let Some(msgs) = openai_req.get("messages").and_then(|m| m.as_array()) {
-        for msg in msgs {
-            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                out.push_str(content);
+fn collect_block_text(block: &Value, out: &mut String) {
+    let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match block_type {
+        "text" => {
+            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                out.push_str(t);
                 out.push('\n');
             }
         }
+        "tool_result" => {
+            if let Some(name) = block.get("tool_use_id").and_then(|v| v.as_str()) {
+                out.push_str(name);
+                out.push('\n');
+            }
+            match block.get("content") {
+                Some(Value::String(s)) => {
+                    out.push_str(s);
+                    out.push('\n');
+                }
+                Some(Value::Array(arr)) => {
+                    for inner in arr {
+                        collect_block_text(inner, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        "tool_use" => {
+            if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                out.push_str(name);
+                out.push('\n');
+            }
+            if let Some(input) = block.get("input") {
+                out.push_str(&input.to_string());
+                out.push('\n');
+            }
+        }
+        _ => {}
     }
+}
+
+fn anthropic_full_text(body: &Value) -> String {
+    let mut out = String::new();
+
+    if let Some(system) = body.get("system") {
+        match system {
+            Value::String(s) => {
+                out.push_str(s);
+                out.push('\n');
+            }
+            Value::Array(arr) => {
+                for block in arr {
+                    collect_block_text(block, &mut out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            match msg.get("content") {
+                Some(Value::String(s)) => {
+                    out.push_str(s);
+                    out.push('\n');
+                }
+                Some(Value::Array(blocks)) => {
+                    for block in blocks {
+                        collect_block_text(block, &mut out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     out
 }
 
@@ -395,9 +461,13 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
 
     let openai_req = anthropic_to_openai(&anthropic_req);
 
-    let input_text = openai_messages_text(&openai_req);
+    let input_text = anthropic_full_text(&anthropic_req);
     let input_tokens = tokenize_len(&state.tokenizer, &input_text);
-    println!("[messages] computed input_tokens: {}", input_tokens);
+    println!(
+        "[messages] computed input_tokens: {} (from {} chars)",
+        input_tokens,
+        input_text.len()
+    );
 
     let url = format!("{}/v1/chat/completions", state.upstream);
     println!(
@@ -1128,22 +1198,80 @@ mod tests {
     }
 
     #[test]
-    fn openai_messages_text_joins_content() {
+    fn anthropic_full_text_string_content() {
         let req = json!({
-            "messages": [
-                {"role": "system", "content": "sys"},
-                {"role": "user", "content": "hello"},
-                {"role": "assistant", "content": "hi"}
-            ]
+            "system": "You are helpful.",
+            "messages": [{"role": "user", "content": "hello world"}]
         });
-        let text = openai_messages_text(&req);
-        assert_eq!(text, "sys\nhello\nhi\n");
+        let text = anthropic_full_text(&req);
+        assert!(text.contains("You are helpful."));
+        assert!(text.contains("hello world"));
     }
 
     #[test]
-    fn openai_messages_text_empty_when_no_messages() {
-        let req = json!({"model": "m"});
-        assert_eq!(openai_messages_text(&req), "");
+    fn anthropic_full_text_text_blocks() {
+        let req = json!({
+            "system": [{"type": "text", "text": "sysA"}, {"type": "text", "text": "sysB"}],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "piece1"},
+                    {"type": "text", "text": "piece2"}
+                ]
+            }]
+        });
+        let text = anthropic_full_text(&req);
+        assert!(text.contains("sysA"));
+        assert!(text.contains("sysB"));
+        assert!(text.contains("piece1"));
+        assert!(text.contains("piece2"));
+    }
+
+    #[test]
+    fn anthropic_full_text_tool_result_string() {
+        let big = "x".repeat(20_000);
+        let req = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_abc", "content": big.clone()}
+                ]
+            }]
+        });
+        let text = anthropic_full_text(&req);
+        assert!(text.contains(&big));
+        assert!(text.len() >= 20_000);
+    }
+
+    #[test]
+    fn anthropic_full_text_tool_result_blocks() {
+        let req = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_abc", "content": [
+                        {"type": "text", "text": "file contents here"}
+                    ]}
+                ]
+            }]
+        });
+        let text = anthropic_full_text(&req);
+        assert!(text.contains("file contents here"));
+    }
+
+    #[test]
+    fn anthropic_full_text_tool_use_included() {
+        let req = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file": "/x"}}
+                ]
+            }]
+        });
+        let text = anthropic_full_text(&req);
+        assert!(text.contains("Read"));
+        assert!(text.contains("/x"));
     }
 
     #[test]
