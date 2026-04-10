@@ -7,7 +7,7 @@ use axum::{
     extract::{Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get,post},
 };
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
@@ -120,50 +120,96 @@ async fn proxy(
     let uri = req.uri().clone();
     let headers = req.headers().clone();
 
-    let url = format!(
-        "{}{}",
-        state.upstream,
-        uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
-    );
+    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let url = format!("{}{}", state.upstream, path);
 
-    let body_stream = req.into_body().into_data_stream();
-    let upstream_body = reqwest::Body::wrap_stream(body_stream);
+    println!("[proxy] {} {}", method, path);
+    println!("[proxy] request headers:");
+    for (k, v) in headers.iter() {
+        println!("  {}: {}", k, v.to_str().unwrap_or("<binary>"));
+    }
+
+    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX).await;
+    match &body_bytes {
+        Ok(b) => println!("[proxy] request body ({} bytes): {}", b.len(), 
+            String::from_utf8_lossy(b).chars().take(500).collect::<String>()),
+        Err(e) => println!("[proxy] failed to read request body: {e}"),
+    }
+    let body_bytes = match body_bytes {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("Body read error: {e}")).into_response(),
+    };
 
     let mut upstream_req = state.client.request(method, &url);
     for (key, value) in headers.iter() {
-        if key == "host" {
-            continue;
-        }
+        if key == "host" { continue; }
         upstream_req = upstream_req.header(key, value);
     }
-    upstream_req = upstream_req.body(upstream_body);
+    upstream_req = upstream_req.body(body_bytes);
 
+    println!("[proxy] sending to upstream: {}", url);
     match upstream_req.send().await {
         Ok(resp) => {
-            let status =
-                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let resp_headers = resp.headers().clone();
-
-            let mut response = Response::builder().status(status);
-            for (key, value) in resp_headers.iter() {
-                // content-length is invalid once we stream; let the framework handle framing
-                if key == "content-length" || key == "transfer-encoding" {
-                    continue;
-                }
-                response = response.header(key, value);
+            let status = resp.status();
+            println!("[proxy] upstream status: {}", status);
+            println!("[proxy] upstream response headers:");
+            for (k, v) in resp.headers().iter() {
+                println!("  {}: {}", k, v.to_str().unwrap_or("<binary>"));
             }
 
-            let stream = resp.bytes_stream();
-            response
-                .body(Body::from_stream(stream))
-                .unwrap_or_else(|_| {
-                    Response::builder()
+            let is_streaming = resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.contains("text/event-stream"))
+                .unwrap_or(false);
+
+            println!("[proxy] is_streaming: {}", is_streaming);
+
+            let status_code = StatusCode::from_u16(status.as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let resp_headers = resp.headers().clone();
+
+            if is_streaming {
+                println!("[proxy] piping as stream");
+                let mut response = Response::builder().status(status_code);
+                for (key, value) in resp_headers.iter() {
+                    if key == "content-length" || key == "transfer-encoding" { continue; }
+                    response = response.header(key, value);
+                }
+                let stream = resp.bytes_stream();
+                response
+                    .body(Body::from_stream(stream))
+                    .unwrap_or_else(|_| Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::empty())
-                        .unwrap()
-                })
+                        .body(Body::empty()).unwrap())
+            } else {
+                println!("[proxy] buffering non-streaming response");
+                match resp.bytes().await {
+                    Ok(bytes) => {
+                        println!("[proxy] response body ({} bytes): {}", bytes.len(),
+                            String::from_utf8_lossy(&bytes).chars().take(500).collect::<String>());
+                        let mut response = Response::builder().status(status_code);
+                        for (key, value) in resp_headers.iter() {
+                            if key == "content-length" || key == "transfer-encoding" { continue; }
+                            response = response.header(key, value);
+                        }
+                        response.body(Body::from(bytes)).unwrap_or_else(|_| {
+                            Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Body::empty()).unwrap()
+                        })
+                    }
+                    Err(e) => {
+                        println!("[proxy] failed to read response body: {e}");
+                        (StatusCode::BAD_GATEWAY, format!("Upstream read error: {e}")).into_response()
+                    }
+                }
+            }
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")).into_response(),
+        Err(e) => {
+            println!("[proxy] upstream request failed: {e}");
+            (StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")).into_response()
+        }
     }
 }
 
@@ -197,6 +243,7 @@ async fn main() {
     });
 
     let app = Router::new()
+        .route("/", get(|| async { StatusCode::OK }))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .fallback(proxy)
         .with_state(state.clone());
