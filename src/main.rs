@@ -16,6 +16,8 @@ struct AppState {
     tokenizer: Tokenizer,
     client: reqwest::Client,
     upstream: String,
+    api_key: Option<String>,        // key we expect from clients
+    upstream_api_key: Option<String>, // key we send to vMLX
 }
 
 #[derive(Deserialize)]
@@ -123,10 +125,36 @@ async fn proxy(
     let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let url = format!("{}{}", state.upstream, path);
 
-    println!("[proxy] {} {}", method, path);
+    println!("[proxy] {} {}", &method, path);
     println!("[proxy] request headers:");
     for (k, v) in headers.iter() {
         println!("  {}: {}", k, v.to_str().unwrap_or("<binary>"));
+    }
+
+    // validate incoming key if configured
+    if let Some(expected) = &state.api_key {
+        let provided = headers
+            .get("x-api-key")
+            .or_else(|| headers.get("authorization"))
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim_start_matches("Bearer ").trim());
+        
+        match provided {
+            Some(key) if key == expected.as_str() => {}
+            _ => {
+                println!("[proxy] unauthorized request to {}", path);
+                return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+            }
+        }
+    }
+
+    // build upstream request, swapping auth header
+    let mut upstream_req = state.client.request(method.clone(), &url);
+    for (key, value) in headers.iter() {
+        if key == "host" || key == "x-api-key" || key == "authorization" { 
+            continue; 
+        }
+        upstream_req = upstream_req.header(key, value);
     }
 
     let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX).await;
@@ -146,6 +174,14 @@ async fn proxy(
         upstream_req = upstream_req.header(key, value);
     }
     upstream_req = upstream_req.body(body_bytes);
+
+    // inject vMLX key in the format it expects
+    if let Some(upstream_key) = &state.upstream_api_key {
+        upstream_req = upstream_req.header(
+            "authorization", 
+            format!("Bearer {}", upstream_key)
+        );
+    }
 
     println!("[proxy] sending to upstream: {}", url);
     match upstream_req.send().await {
@@ -223,6 +259,8 @@ async fn main() {
         .unwrap_or(8001);
     let upstream =
         env::var("UPSTREAM_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
+    let api_key = env::var("API_KEY").ok();
+    let upstream_api_key = env::var("UPSTREAM_API_KEY").ok();
 
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .unwrap_or_else(|e| panic!("Failed to load tokenizer from {tokenizer_path}: {e}"));
@@ -240,6 +278,8 @@ async fn main() {
         tokenizer,
         client,
         upstream,
+        api_key,
+        upstream_api_key,
     });
 
     let app = Router::new()
