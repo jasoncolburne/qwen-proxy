@@ -747,21 +747,19 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
         let mut upstream_stream = resp.bytes_stream();
 
         let translated = async_stream::stream! {
-            let mut emit_count: u64 = 0;
-
             macro_rules! emit {
                 ($event:expr, $data:expr) => {{
                     let bytes = sse_event($event, $data);
-                    emit_count += 1;
-                    println!(
-                        "[sse-emit] {} {}",
-                        $event,
-                        String::from_utf8_lossy(&bytes)
-                            .replace('\n', "\\n")
-                            .chars()
-                            .take(300)
-                            .collect::<String>()
-                    );
+                    if $event == "content_block_delta" {
+                        println!(
+                            "[sse-emit] {}",
+                            String::from_utf8_lossy(&bytes)
+                                .replace('\n', "\\n")
+                                .chars()
+                                .take(300)
+                                .collect::<String>()
+                        );
+                    }
                     yield Ok::<Bytes, std::io::Error>(bytes);
                 }};
             }
@@ -811,22 +809,17 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                         if line.is_empty() {
                             continue;
                         }
-                        println!("[sse-raw] {}", line);
                         let data = match line.strip_prefix("data:") {
                             Some(d) => d.trim(),
                             None => continue,
                         };
-                        if data.is_empty() {
-                            continue;
-                        }
-                        if data == "[DONE]" {
-                            println!("[sse-raw] got [DONE]");
+                        if data.is_empty() || data == "[DONE]" {
                             continue;
                         }
                         let json_val: Value = match serde_json::from_str(data) {
                             Ok(v) => v,
                             Err(e) => {
-                                println!("[sse-err] json parse: {e} | data={}", data.chars().take(200).collect::<String>());
+                                println!("[sse-err] json parse: {e}");
                                 continue;
                             }
                         };
@@ -851,14 +844,7 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                 }
             }
 
-            println!(
-                "[sse-buffered] {} chars: {}",
-                full_text.len(),
-                full_text.chars().take(500).collect::<String>()
-            );
-
             let segments = parse_segments(&full_text);
-            println!("[sse-segments] {} segments", segments.len());
 
             let mut has_tool_use = false;
             for (idx, seg) in segments.iter().enumerate() {
@@ -933,8 +919,6 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
             emit!("message_delta", &msg_delta);
 
             emit!("message_stop", &json!({"type": "message_stop"}));
-
-            println!("[sse-done] {} chunks", emit_count);
         };
 
         Response::builder()
