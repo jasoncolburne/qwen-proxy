@@ -9,7 +9,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use bytes::Bytes;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 
 struct AppState {
@@ -115,6 +118,402 @@ async fn count_tokens(
             format!("Tokenizer error: {e}"),
         )
             .into_response(),
+    }
+}
+
+fn check_auth(headers: &axum::http::HeaderMap, expected: &Option<String>) -> bool {
+    match expected {
+        None => true,
+        Some(expected) => {
+            let provided = headers
+                .get("x-api-key")
+                .or_else(|| headers.get("authorization"))
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim_start_matches("Bearer ").trim());
+            matches!(provided, Some(key) if key == expected.as_str())
+        }
+    }
+}
+
+fn anthropic_to_openai(body: &Value) -> Value {
+    let mut messages_out: Vec<Value> = Vec::new();
+
+    if let Some(system) = body.get("system") {
+        let text = match system {
+            Value::String(s) => s.clone(),
+            Value::Array(arr) => arr
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        };
+        if !text.is_empty() {
+            messages_out.push(json!({"role": "system", "content": text}));
+        }
+    }
+
+    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let content = match msg.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(blocks)) => blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(""),
+                _ => String::new(),
+            };
+            messages_out.push(json!({"role": role, "content": content}));
+        }
+    }
+
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let stream_requested = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut out = json!({
+        "model": model,
+        "messages": messages_out,
+        "stream": stream_requested,
+    });
+    if let Some(mt) = body.get("max_tokens") {
+        out["max_tokens"] = mt.clone();
+    }
+    if let Some(t) = body.get("temperature") {
+        out["temperature"] = t.clone();
+    }
+    if let Some(tp) = body.get("top_p") {
+        out["top_p"] = tp.clone();
+    }
+    if let Some(ss) = body.get("stop_sequences") {
+        out["stop"] = ss.clone();
+    }
+    out
+}
+
+fn map_stop_reason(fr: &str) -> &'static str {
+    match fr {
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        "tool_calls" => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+fn find_event_boundary(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == b'\n' && i + 1 < buf.len() && buf[i + 1] == b'\n' {
+            return Some(i + 2);
+        }
+        if i + 3 < buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i + 4);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn sse_event(event: &str, data: &Value) -> Bytes {
+    Bytes::from(format!("event: {}\ndata: {}\n\n", event, data))
+}
+
+async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    let headers = req.headers().clone();
+
+    if !check_auth(&headers, &state.api_key) {
+        println!("[messages] unauthorized");
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("Body read error: {e}")).into_response();
+        }
+    };
+
+    let anthropic_req: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("JSON parse error: {e}")).into_response();
+        }
+    };
+
+    let model = anthropic_req
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let stream_requested = anthropic_req
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let openai_req = anthropic_to_openai(&anthropic_req);
+
+    let url = format!("{}/v1/chat/completions", state.upstream);
+    println!(
+        "[messages] translating POST /v1/messages -> {} (stream={})",
+        url, stream_requested
+    );
+
+    let mut upstream_req = state.client.post(&url).json(&openai_req);
+    for (key, value) in headers.iter() {
+        let k = key.as_str();
+        if k == "host"
+            || k == "content-length"
+            || k == "content-type"
+            || k == "x-api-key"
+            || k == "authorization"
+            || k == "anthropic-beta"
+            || k == "anthropic-version"
+        {
+            continue;
+        }
+        upstream_req = upstream_req.header(key, value);
+    }
+    if let Some(upstream_key) = &state.upstream_api_key {
+        upstream_req = upstream_req.header("authorization", format!("Bearer {}", upstream_key));
+    }
+
+    let resp = match upstream_req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[messages] upstream error: {e}");
+            return (StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")).into_response();
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let bytes = resp.bytes().await.unwrap_or_default();
+        println!(
+            "[messages] upstream non-success {}: {}",
+            status,
+            String::from_utf8_lossy(&bytes).chars().take(500).collect::<String>()
+        );
+        return (code, bytes).into_response();
+    }
+
+    if stream_requested {
+        let msg_id = format!(
+            "msg_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let model_for_stream = model.clone();
+        let mut upstream_stream = resp.bytes_stream();
+
+        let translated = async_stream::stream! {
+            let start = json!({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model_for_stream,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            });
+            yield Ok::<Bytes, std::io::Error>(sse_event("message_start", &start));
+
+            let cb_start = json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            });
+            yield Ok(sse_event("content_block_start", &cb_start));
+
+            yield Ok(sse_event("ping", &json!({"type": "ping"})));
+
+            let mut buf: Vec<u8> = Vec::new();
+            let mut stop_reason = "end_turn".to_string();
+            let mut output_tokens: u64 = 0;
+            let mut input_tokens: u64 = 0;
+
+            'outer: while let Some(chunk) = upstream_stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        println!("[messages] upstream stream error: {e}");
+                        break 'outer;
+                    }
+                };
+                buf.extend_from_slice(&chunk);
+
+                while let Some(end) = find_event_boundary(&buf) {
+                    let event_bytes: Vec<u8> = buf.drain(..end).collect();
+                    let event_str = match std::str::from_utf8(&event_bytes) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+
+                    for line in event_str.lines() {
+                        let line = line.trim_end_matches('\r');
+                        let data = match line.strip_prefix("data:") {
+                            Some(d) => d.trim(),
+                            None => continue,
+                        };
+                        if data.is_empty() || data == "[DONE]" {
+                            continue;
+                        }
+                        let json_val: Value = match serde_json::from_str(data) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        if let Some(choices) = json_val.get("choices").and_then(|c| c.as_array()) {
+                            for choice in choices {
+                                if let Some(delta) = choice.get("delta") {
+                                    if let Some(content) =
+                                        delta.get("content").and_then(|c| c.as_str())
+                                    {
+                                        if !content.is_empty() {
+                                            let evt = json!({
+                                                "type": "content_block_delta",
+                                                "index": 0,
+                                                "delta": {
+                                                    "type": "text_delta",
+                                                    "text": content
+                                                }
+                                            });
+                                            yield Ok(sse_event("content_block_delta", &evt));
+                                        }
+                                    }
+                                }
+                                if let Some(fr) =
+                                    choice.get("finish_reason").and_then(|f| f.as_str())
+                                {
+                                    stop_reason = map_stop_reason(fr).to_string();
+                                }
+                            }
+                        }
+                        if let Some(usage) = json_val.get("usage") {
+                            if let Some(ct) =
+                                usage.get("completion_tokens").and_then(|v| v.as_u64())
+                            {
+                                output_tokens = ct;
+                            }
+                            if let Some(pt) =
+                                usage.get("prompt_tokens").and_then(|v| v.as_u64())
+                            {
+                                input_tokens = pt;
+                            }
+                        }
+                    }
+                }
+            }
+
+            yield Ok(sse_event(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ));
+
+            let msg_delta = json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            });
+            yield Ok(sse_event("message_delta", &msg_delta));
+
+            yield Ok(sse_event("message_stop", &json!({"type": "message_stop"})));
+        };
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("connection", "keep-alive")
+            .body(Body::from_stream(translated))
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap()
+            })
+    } else {
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("Upstream read error: {e}"))
+                    .into_response();
+            }
+        };
+        let openai_resp: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("Upstream JSON error: {e}"))
+                    .into_response();
+            }
+        };
+
+        let choice0 = openai_resp
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first());
+        let text = choice0
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        let finish_reason = choice0
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|f| f.as_str())
+            .unwrap_or("stop");
+        let id = openai_resp
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("msg_{}", s))
+            .unwrap_or_else(|| "msg_unknown".to_string());
+        let input_tokens = openai_resp
+            .get("usage")
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let output_tokens = openai_resp
+            .get("usage")
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let anthropic_resp = json!({
+            "id": id,
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "model": model,
+            "stop_reason": map_stop_reason(finish_reason),
+            "stop_sequence": null,
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+        });
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(anthropic_resp.to_string()))
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap()
+            })
     }
 }
 
@@ -309,6 +708,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(|| async { StatusCode::OK }))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/messages", post(messages))
         .fallback(proxy)
         .with_state(state.clone());
 
