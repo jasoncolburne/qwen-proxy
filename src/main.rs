@@ -7,7 +7,7 @@ use axum::{
     extract::{Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get,post},
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
@@ -16,7 +16,7 @@ struct AppState {
     tokenizer: Tokenizer,
     client: reqwest::Client,
     upstream: String,
-    api_key: Option<String>,        // key we expect from clients
+    api_key: Option<String>,          // key we expect from clients
     upstream_api_key: Option<String>, // key we send to vMLX
 }
 
@@ -110,14 +110,15 @@ async fn count_tokens(
             input_tokens: enc.get_ids().len(),
         })
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Tokenizer error: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Tokenizer error: {e}"),
+        )
+            .into_response(),
     }
 }
 
-async fn proxy(
-    State(state): State<Arc<AppState>>,
-    req: Request<Body>,
-) -> impl IntoResponse {
+async fn proxy(State(state): State<Arc<AppState>>, req: Request<Body>) -> impl IntoResponse {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
@@ -138,7 +139,7 @@ async fn proxy(
             .or_else(|| headers.get("authorization"))
             .and_then(|v| v.to_str().ok())
             .map(|v| v.trim_start_matches("Bearer ").trim());
-        
+
         match provided {
             Some(key) if key == expected.as_str() => {}
             _ => {
@@ -151,36 +152,44 @@ async fn proxy(
     // build upstream request, swapping auth header
     let mut upstream_req = state.client.request(method.clone(), &url);
     for (key, value) in headers.iter() {
-        if key == "host" || key == "x-api-key" || key == "authorization" { 
-            continue; 
+        if key == "host" || key == "x-api-key" || key == "authorization" || key == "anthropic-beta"
+        {
+            continue;
         }
         upstream_req = upstream_req.header(key, value);
     }
 
     let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX).await;
     match &body_bytes {
-        Ok(b) => println!("[proxy] request body ({} bytes): {}", b.len(), 
-            String::from_utf8_lossy(b).chars().take(500).collect::<String>()),
+        Ok(b) => println!(
+            "[proxy] request body ({} bytes): {}",
+            b.len(),
+            String::from_utf8_lossy(b)
+                .chars()
+                .take(500)
+                .collect::<String>()
+        ),
         Err(e) => println!("[proxy] failed to read request body: {e}"),
     }
     let body_bytes = match body_bytes {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Body read error: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("Body read error: {e}")).into_response();
+        }
     };
 
     let mut upstream_req = state.client.request(method, &url);
     for (key, value) in headers.iter() {
-        if key == "host" { continue; }
+        if key == "host" {
+            continue;
+        }
         upstream_req = upstream_req.header(key, value);
     }
     upstream_req = upstream_req.body(body_bytes);
 
     // inject vMLX key in the format it expects
     if let Some(upstream_key) = &state.upstream_api_key {
-        upstream_req = upstream_req.header(
-            "authorization", 
-            format!("Bearer {}", upstream_key)
-        );
+        upstream_req = upstream_req.header("authorization", format!("Bearer {}", upstream_key));
     }
 
     println!("[proxy] sending to upstream: {}", url);
@@ -193,7 +202,8 @@ async fn proxy(
                 println!("  {}: {}", k, v.to_str().unwrap_or("<binary>"));
             }
 
-            let is_streaming = resp.headers()
+            let is_streaming = resp
+                .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.contains("text/event-stream"))
@@ -201,43 +211,58 @@ async fn proxy(
 
             println!("[proxy] is_streaming: {}", is_streaming);
 
-            let status_code = StatusCode::from_u16(status.as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let status_code =
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let resp_headers = resp.headers().clone();
 
             if is_streaming {
                 println!("[proxy] piping as stream");
                 let mut response = Response::builder().status(status_code);
                 for (key, value) in resp_headers.iter() {
-                    if key == "content-length" || key == "transfer-encoding" { continue; }
+                    if key == "content-length" || key == "transfer-encoding" {
+                        continue;
+                    }
                     response = response.header(key, value);
                 }
                 let stream = resp.bytes_stream();
                 response
                     .body(Body::from_stream(stream))
-                    .unwrap_or_else(|_| Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::empty()).unwrap())
+                    .unwrap_or_else(|_| {
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Body::empty())
+                            .unwrap()
+                    })
             } else {
                 println!("[proxy] buffering non-streaming response");
                 match resp.bytes().await {
                     Ok(bytes) => {
-                        println!("[proxy] response body ({} bytes): {}", bytes.len(),
-                            String::from_utf8_lossy(&bytes).chars().take(500).collect::<String>());
+                        println!(
+                            "[proxy] response body ({} bytes): {}",
+                            bytes.len(),
+                            String::from_utf8_lossy(&bytes)
+                                .chars()
+                                .take(500)
+                                .collect::<String>()
+                        );
                         let mut response = Response::builder().status(status_code);
                         for (key, value) in resp_headers.iter() {
-                            if key == "content-length" || key == "transfer-encoding" { continue; }
+                            if key == "content-length" || key == "transfer-encoding" {
+                                continue;
+                            }
                             response = response.header(key, value);
                         }
                         response.body(Body::from(bytes)).unwrap_or_else(|_| {
                             Response::builder()
                                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(Body::empty()).unwrap()
+                                .body(Body::empty())
+                                .unwrap()
                         })
                     }
                     Err(e) => {
                         println!("[proxy] failed to read response body: {e}");
-                        (StatusCode::BAD_GATEWAY, format!("Upstream read error: {e}")).into_response()
+                        (StatusCode::BAD_GATEWAY, format!("Upstream read error: {e}"))
+                            .into_response()
                     }
                 }
             }
@@ -257,8 +282,7 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8001);
-    let upstream =
-        env::var("UPSTREAM_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
+    let upstream = env::var("UPSTREAM_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
     let api_key = env::var("API_KEY").ok();
     let upstream_api_key = env::var("UPSTREAM_API_KEY").ok();
 
@@ -292,6 +316,9 @@ async fn main() {
         .await
         .expect("Failed to bind");
 
-    println!("qwen-proxy listening on port {port}, upstream: {}", state.upstream);
+    println!(
+        "qwen-proxy listening on port {port}, upstream: {}",
+        state.upstream
+    );
     axum::serve(listener, app).await.expect("Server error");
 }
