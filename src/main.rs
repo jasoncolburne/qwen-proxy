@@ -228,6 +228,102 @@ fn sse_event(event: &str, data: &Value) -> Bytes {
     Bytes::from(format!("event: {}\ndata: {}\n\n", event, data))
 }
 
+enum Segment {
+    Text(String),
+    ToolCall { name: String, input: Value },
+}
+
+fn parse_tool_call(body: &str) -> Option<(String, Value)> {
+    let body = body.trim();
+    let (name, mut rest) = match body.find(char::is_whitespace) {
+        Some(pos) => (body[..pos].to_string(), body[pos..].trim_start()),
+        None => (body.to_string(), ""),
+    };
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut input = serde_json::Map::new();
+    while !rest.is_empty() {
+        let eq = match rest.find('=') {
+            Some(p) => p,
+            None => break,
+        };
+        let key = rest[..eq].trim().to_string();
+        let after_eq = &rest[eq + 1..];
+        if !after_eq.starts_with('"') {
+            break;
+        }
+        let after_quote = &after_eq[1..];
+
+        let mut val = String::new();
+        let mut end_byte: Option<usize> = None;
+        let mut chars = after_quote.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if c == '\\' {
+                if let Some((_, next)) = chars.next() {
+                    match next {
+                        'n' => val.push('\n'),
+                        't' => val.push('\t'),
+                        'r' => val.push('\r'),
+                        '"' => val.push('"'),
+                        '\\' => val.push('\\'),
+                        other => {
+                            val.push('\\');
+                            val.push(other);
+                        }
+                    }
+                }
+            } else if c == '"' {
+                end_byte = Some(i);
+                break;
+            } else {
+                val.push(c);
+            }
+        }
+
+        let end = match end_byte {
+            Some(e) => e,
+            None => break,
+        };
+        if !key.is_empty() {
+            input.insert(key, Value::String(val));
+        }
+        rest = after_quote[end + 1..].trim_start();
+    }
+
+    Some((name, Value::Object(input)))
+}
+
+fn parse_segments(full: &str) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut remaining = full;
+    while let Some(start) = remaining.find("<tool_call>") {
+        let (before, rest) = remaining.split_at(start);
+        if !before.is_empty() {
+            out.push(Segment::Text(before.to_string()));
+        }
+        let after_open = &rest["<tool_call>".len()..];
+        match after_open.find("</tool_call>") {
+            Some(end) => {
+                let body = &after_open[..end];
+                if let Some((name, input)) = parse_tool_call(body) {
+                    out.push(Segment::ToolCall { name, input });
+                }
+                remaining = &after_open[end + "</tool_call>".len()..];
+            }
+            None => {
+                out.push(Segment::Text(rest.to_string()));
+                return out;
+            }
+        }
+    }
+    if !remaining.is_empty() {
+        out.push(Segment::Text(remaining.to_string()));
+    }
+    out
+}
+
 async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -385,17 +481,10 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                 }
             });
             emit!("message_start", &start);
-
-            let cb_start = json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""}
-            });
-            emit!("content_block_start", &cb_start);
-
             emit!("ping", &json!({"type": "ping"}));
 
             let mut buf: Vec<u8> = Vec::new();
+            let mut full_text = String::new();
             let mut stop_reason = "end_turn".to_string();
             let mut output_tokens: u64 = 0;
             let mut input_tokens: u64 = 0;
@@ -447,22 +536,12 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
 
                         if let Some(choices) = json_val.get("choices").and_then(|c| c.as_array()) {
                             for choice in choices {
-                                if let Some(delta) = choice.get("delta") {
-                                    if let Some(content) =
-                                        delta.get("content").and_then(|c| c.as_str())
-                                    {
-                                        if !content.is_empty() {
-                                            let evt = json!({
-                                                "type": "content_block_delta",
-                                                "index": 0,
-                                                "delta": {
-                                                    "type": "text_delta",
-                                                    "text": content
-                                                }
-                                            });
-                                            emit!("content_block_delta", &evt);
-                                        }
-                                    }
+                                if let Some(content) = choice
+                                    .get("delta")
+                                    .and_then(|d| d.get("content"))
+                                    .and_then(|c| c.as_str())
+                                {
+                                    full_text.push_str(content);
                                 }
                                 if let Some(fr) =
                                     choice.get("finish_reason").and_then(|f| f.as_str())
@@ -487,10 +566,82 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                 }
             }
 
-            emit!(
-                "content_block_stop",
-                &json!({"type": "content_block_stop", "index": 0})
+            println!(
+                "[sse-buffered] {} chars: {}",
+                full_text.len(),
+                full_text.chars().take(500).collect::<String>()
             );
+
+            let segments = parse_segments(&full_text);
+            println!("[sse-segments] {} segments", segments.len());
+
+            let mut has_tool_use = false;
+            for (idx, seg) in segments.iter().enumerate() {
+                match seg {
+                    Segment::Text(text) => {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let cb_start = json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {"type": "text", "text": ""}
+                        });
+                        emit!("content_block_start", &cb_start);
+
+                        let delta = json!({
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": {"type": "text_delta", "text": text}
+                        });
+                        emit!("content_block_delta", &delta);
+
+                        emit!(
+                            "content_block_stop",
+                            &json!({"type": "content_block_stop", "index": idx})
+                        );
+                    }
+                    Segment::ToolCall { name, input } => {
+                        has_tool_use = true;
+                        let tool_id = format!(
+                            "toolu_{}_{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or(0),
+                            idx
+                        );
+                        let cb_start = json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tool_id,
+                                "name": name,
+                                "input": {}
+                            }
+                        });
+                        emit!("content_block_start", &cb_start);
+
+                        let partial = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                        let delta = json!({
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": {"type": "input_json_delta", "partial_json": partial}
+                        });
+                        emit!("content_block_delta", &delta);
+
+                        emit!(
+                            "content_block_stop",
+                            &json!({"type": "content_block_stop", "index": idx})
+                        );
+                    }
+                }
+            }
+
+            if has_tool_use {
+                stop_reason = "tool_use".to_string();
+            }
 
             let msg_delta = json!({
                 "type": "message_delta",
@@ -800,4 +951,160 @@ async fn main() {
         state.upstream
     );
     axum::serve(listener, app).await.expect("Server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_stop_reason_known() {
+        assert_eq!(map_stop_reason("stop"), "end_turn");
+        assert_eq!(map_stop_reason("length"), "max_tokens");
+        assert_eq!(map_stop_reason("tool_calls"), "tool_use");
+        assert_eq!(map_stop_reason("weird"), "end_turn");
+    }
+
+    #[test]
+    fn find_event_boundary_lf() {
+        let buf = b"data: hi\n\nrest";
+        assert_eq!(find_event_boundary(buf), Some(10));
+    }
+
+    #[test]
+    fn find_event_boundary_crlf() {
+        let buf = b"data: hi\r\n\r\nrest";
+        assert_eq!(find_event_boundary(buf), Some(12));
+    }
+
+    #[test]
+    fn find_event_boundary_none() {
+        let buf = b"data: incomplete";
+        assert_eq!(find_event_boundary(buf), None);
+    }
+
+    #[test]
+    fn parse_tool_call_single_attr() {
+        let (name, input) = parse_tool_call("Read file=\"/tmp/x.txt\"").unwrap();
+        assert_eq!(name, "Read");
+        assert_eq!(input["file"], json!("/tmp/x.txt"));
+    }
+
+    #[test]
+    fn parse_tool_call_multi_attr() {
+        let (name, input) =
+            parse_tool_call("Write file=\"/a.txt\" content=\"hello world\"").unwrap();
+        assert_eq!(name, "Write");
+        assert_eq!(input["file"], json!("/a.txt"));
+        assert_eq!(input["content"], json!("hello world"));
+    }
+
+    #[test]
+    fn parse_tool_call_escaped_quote() {
+        let (_, input) = parse_tool_call("Write content=\"say \\\"hi\\\"\"").unwrap();
+        assert_eq!(input["content"], json!("say \"hi\""));
+    }
+
+    #[test]
+    fn parse_tool_call_escaped_newline() {
+        let (_, input) = parse_tool_call("Write content=\"a\\nb\"").unwrap();
+        assert_eq!(input["content"], json!("a\nb"));
+    }
+
+    #[test]
+    fn parse_tool_call_name_with_leading_newline() {
+        let (name, input) =
+            parse_tool_call("\n  Read file=\"/x\"  \n").unwrap();
+        assert_eq!(name, "Read");
+        assert_eq!(input["file"], json!("/x"));
+    }
+
+    #[test]
+    fn parse_segments_text_only() {
+        let segs = parse_segments("just some text");
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            Segment::Text(t) => assert_eq!(t, "just some text"),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn parse_segments_tool_only() {
+        let segs = parse_segments("<tool_call>\nRead file=\"/x\"\n</tool_call>");
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            Segment::ToolCall { name, input } => {
+                assert_eq!(name, "Read");
+                assert_eq!(input["file"], json!("/x"));
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn parse_segments_mixed() {
+        let input = "prefix<tool_call>Read file=\"/a\"</tool_call>middle<tool_call>Read file=\"/b\"</tool_call>suffix";
+        let segs = parse_segments(input);
+        assert_eq!(segs.len(), 5);
+        assert!(matches!(&segs[0], Segment::Text(t) if t == "prefix"));
+        assert!(matches!(&segs[1], Segment::ToolCall { name, .. } if name == "Read"));
+        assert!(matches!(&segs[2], Segment::Text(t) if t == "middle"));
+        assert!(matches!(&segs[3], Segment::ToolCall { .. }));
+        assert!(matches!(&segs[4], Segment::Text(t) if t == "suffix"));
+    }
+
+    #[test]
+    fn anthropic_to_openai_flattens_content_blocks() {
+        let req = json!({
+            "model": "claude-sonnet-4-6",
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hello "},
+                    {"type": "text", "text": "world"}
+                ]}
+            ],
+            "max_tokens": 100
+        });
+        let out = anthropic_to_openai(&req);
+        assert_eq!(out["model"], json!("claude-sonnet-4-6"));
+        assert_eq!(out["messages"][0]["role"], json!("system"));
+        assert_eq!(out["messages"][0]["content"], json!("You are helpful."));
+        assert_eq!(out["messages"][1]["role"], json!("user"));
+        assert_eq!(out["messages"][1]["content"], json!("hello world"));
+        assert_eq!(out["max_tokens"], json!(100));
+    }
+
+    #[test]
+    fn anthropic_to_openai_system_blocks() {
+        let req = json!({
+            "model": "m",
+            "system": [{"type": "text", "text": "sysA"}, {"type": "text", "text": "sysB"}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = anthropic_to_openai(&req);
+        assert_eq!(out["messages"][0]["content"], json!("sysAsysB"));
+    }
+
+    #[test]
+    fn anthropic_to_openai_caps_max_tokens() {
+        let req = json!({
+            "model": "m",
+            "messages": [],
+            "max_tokens": 1_000_000u64
+        });
+        let out = anthropic_to_openai(&req);
+        assert_eq!(out["max_tokens"], json!(65536));
+    }
+
+    #[test]
+    fn anthropic_to_openai_skips_empty_system() {
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = anthropic_to_openai(&req);
+        assert_eq!(out["messages"][0]["role"], json!("user"));
+    }
 }
