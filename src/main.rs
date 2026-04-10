@@ -186,7 +186,8 @@ fn anthropic_to_openai(body: &Value) -> Value {
         "stream": stream_requested,
     });
     if let Some(mt) = body.get("max_tokens") {
-        out["max_tokens"] = mt.clone();
+        let capped = mt.as_u64().map(|n| n.min(8192)).unwrap_or(8192);
+        out["max_tokens"] = json!(capped);
     }
     if let Some(t) = body.get("temperature") {
         out["temperature"] = t.clone();
@@ -351,6 +352,25 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
         let mut upstream_stream = resp.bytes_stream();
 
         let translated = async_stream::stream! {
+            let mut emit_count: u64 = 0;
+
+            macro_rules! emit {
+                ($event:expr, $data:expr) => {{
+                    let bytes = sse_event($event, $data);
+                    emit_count += 1;
+                    println!(
+                        "[sse-emit] {} {}",
+                        $event,
+                        String::from_utf8_lossy(&bytes)
+                            .replace('\n', "\\n")
+                            .chars()
+                            .take(300)
+                            .collect::<String>()
+                    );
+                    yield Ok::<Bytes, std::io::Error>(bytes);
+                }};
+            }
+
             let start = json!({
                 "type": "message_start",
                 "message": {
@@ -364,16 +384,16 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                     "usage": {"input_tokens": 0, "output_tokens": 0}
                 }
             });
-            yield Ok::<Bytes, std::io::Error>(sse_event("message_start", &start));
+            emit!("message_start", &start);
 
             let cb_start = json!({
                 "type": "content_block_start",
                 "index": 0,
                 "content_block": {"type": "text", "text": ""}
             });
-            yield Ok(sse_event("content_block_start", &cb_start));
+            emit!("content_block_start", &cb_start);
 
-            yield Ok(sse_event("ping", &json!({"type": "ping"})));
+            emit!("ping", &json!({"type": "ping"}));
 
             let mut buf: Vec<u8> = Vec::new();
             let mut stop_reason = "end_turn".to_string();
@@ -384,7 +404,7 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
-                        println!("[messages] upstream stream error: {e}");
+                        println!("[sse-err] upstream stream error: {e}");
                         break 'outer;
                     }
                 };
@@ -394,21 +414,35 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                     let event_bytes: Vec<u8> = buf.drain(..end).collect();
                     let event_str = match std::str::from_utf8(&event_bytes) {
                         Ok(s) => s,
-                        Err(_) => continue,
+                        Err(e) => {
+                            println!("[sse-err] non-utf8 frame: {e}");
+                            continue;
+                        }
                     };
 
                     for line in event_str.lines() {
                         let line = line.trim_end_matches('\r');
+                        if line.is_empty() {
+                            continue;
+                        }
+                        println!("[sse-raw] {}", line);
                         let data = match line.strip_prefix("data:") {
                             Some(d) => d.trim(),
                             None => continue,
                         };
-                        if data.is_empty() || data == "[DONE]" {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        if data == "[DONE]" {
+                            println!("[sse-raw] got [DONE]");
                             continue;
                         }
                         let json_val: Value = match serde_json::from_str(data) {
                             Ok(v) => v,
-                            Err(_) => continue,
+                            Err(e) => {
+                                println!("[sse-err] json parse: {e} | data={}", data.chars().take(200).collect::<String>());
+                                continue;
+                            }
                         };
 
                         if let Some(choices) = json_val.get("choices").and_then(|c| c.as_array()) {
@@ -426,7 +460,7 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                                                     "text": content
                                                 }
                                             });
-                                            yield Ok(sse_event("content_block_delta", &evt));
+                                            emit!("content_block_delta", &evt);
                                         }
                                     }
                                 }
@@ -453,19 +487,21 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                 }
             }
 
-            yield Ok(sse_event(
+            emit!(
                 "content_block_stop",
-                &json!({"type": "content_block_stop", "index": 0}),
-            ));
+                &json!({"type": "content_block_stop", "index": 0})
+            );
 
             let msg_delta = json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": null},
                 "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
             });
-            yield Ok(sse_event("message_delta", &msg_delta));
+            emit!("message_delta", &msg_delta);
 
-            yield Ok(sse_event("message_stop", &json!({"type": "message_stop"})));
+            emit!("message_stop", &json!({"type": "message_stop"}));
+
+            println!("[sse-done] {} chunks", emit_count);
         };
 
         Response::builder()
