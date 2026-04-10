@@ -186,7 +186,7 @@ fn anthropic_to_openai(body: &Value) -> Value {
         "stream": stream_requested,
     });
     if let Some(mt) = body.get("max_tokens") {
-        let capped = mt.as_u64().map(|n| n.min(8192)).unwrap_or(8192);
+        let capped = mt.as_u64().map(|n| n.min(65536)).unwrap_or(65536);
         out["max_tokens"] = json!(capped);
     }
     if let Some(t) = body.get("temperature") {
