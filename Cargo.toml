@@ -14,3 +14,4 @@ http-body-util = "0.1"
 async-stream = "0.3"
 futures-util = "0.3"
 bytes = "1"
+uuid = { version = "1", features = ["v4"] }

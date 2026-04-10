@@ -304,19 +304,17 @@ fn parse_segments(full: &str) -> Vec<Segment> {
             out.push(Segment::Text(before.to_string()));
         }
         let after_open = &rest["<tool_call>".len()..];
-        match after_open.find("</tool_call>") {
-            Some(end) => {
-                let body = &after_open[..end];
-                if let Some((name, input)) = parse_tool_call(body) {
-                    out.push(Segment::ToolCall { name, input });
-                }
-                remaining = &after_open[end + "</tool_call>".len()..];
-            }
-            None => {
-                out.push(Segment::Text(rest.to_string()));
-                return out;
-            }
+        let (body, next) = match after_open.find("</tool_call>") {
+            Some(end) => (
+                &after_open[..end],
+                &after_open[end + "</tool_call>".len()..],
+            ),
+            None => (after_open, ""),
+        };
+        if let Some((name, input)) = parse_tool_call(body) {
+            out.push(Segment::ToolCall { name, input });
         }
+        remaining = next;
     }
     if !remaining.is_empty() {
         out.push(Segment::Text(remaining.to_string()));
@@ -603,14 +601,8 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                     }
                     Segment::ToolCall { name, input } => {
                         has_tool_use = true;
-                        let tool_id = format!(
-                            "toolu_{}_{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos())
-                                .unwrap_or(0),
-                            idx
-                        );
+                        let uuid = uuid::Uuid::new_v4().simple().to_string();
+                        let tool_id = format!("toolu_{}", &uuid[..8]);
                         let cb_start = json!({
                             "type": "content_block_start",
                             "index": idx,
@@ -1039,6 +1031,37 @@ mod tests {
                 assert_eq!(input["file"], json!("/x"));
             }
             _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn parse_segments_unterminated_tool_call() {
+        let segs = parse_segments("prefix<tool_call>\nRead file=\"/x\"\n");
+        assert_eq!(segs.len(), 2);
+        match &segs[0] {
+            Segment::Text(t) => assert_eq!(t, "prefix"),
+            _ => panic!("expected text"),
+        }
+        match &segs[1] {
+            Segment::ToolCall { name, input } => {
+                assert_eq!(name, "Read");
+                assert_eq!(input["file"], json!("/x"));
+            }
+            _ => panic!("expected tool_call"),
+        }
+    }
+
+    #[test]
+    fn parse_segments_unterminated_tool_call_only() {
+        let segs = parse_segments("<tool_call>Write file=\"/a\" content=\"hi\"");
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            Segment::ToolCall { name, input } => {
+                assert_eq!(name, "Write");
+                assert_eq!(input["file"], json!("/a"));
+                assert_eq!(input["content"], json!("hi"));
+            }
+            _ => panic!("expected tool_call"),
         }
     }
 
