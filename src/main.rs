@@ -135,6 +135,108 @@ fn check_auth(headers: &axum::http::HeaderMap, expected: &Option<String>) -> boo
     }
 }
 
+fn translate_user_content(blocks: &[Value], out: &mut Vec<Value>) {
+    let mut pending_text = String::new();
+    let flush_text = |buf: &mut String, out: &mut Vec<Value>| {
+        if !buf.is_empty() {
+            out.push(json!({"role": "user", "content": buf.clone()}));
+            buf.clear();
+        }
+    };
+    for block in blocks {
+        let t = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match t {
+            "text" => {
+                if let Some(s) = block.get("text").and_then(|v| v.as_str()) {
+                    if !pending_text.is_empty() {
+                        pending_text.push('\n');
+                    }
+                    pending_text.push_str(s);
+                }
+            }
+            "tool_result" => {
+                flush_text(&mut pending_text, out);
+                let tool_use_id = block
+                    .get("tool_use_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let content_text = match block.get("content") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(arr)) => arr
+                        .iter()
+                        .filter_map(|b| {
+                            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => String::new(),
+                };
+                out.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_use_id,
+                    "content": content_text,
+                }));
+            }
+            _ => {}
+        }
+    }
+    flush_text(&mut pending_text, out);
+}
+
+fn translate_assistant_content(blocks: &[Value], out: &mut Vec<Value>) {
+    let mut text_content = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    for block in blocks {
+        let t = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match t {
+            "text" => {
+                if let Some(s) = block.get("text").and_then(|v| v.as_str()) {
+                    if !text_content.is_empty() {
+                        text_content.push('\n');
+                    }
+                    text_content.push_str(s);
+                }
+            }
+            "tool_use" => {
+                let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let arguments = block
+                    .get("input")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "{}".to_string());
+                tool_calls.push(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments}
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    if tool_calls.is_empty() {
+        out.push(json!({"role": "assistant", "content": text_content}));
+    } else {
+        let mut msg = serde_json::Map::new();
+        msg.insert("role".to_string(), json!("assistant"));
+        msg.insert(
+            "content".to_string(),
+            if text_content.is_empty() {
+                Value::Null
+            } else {
+                Value::String(text_content)
+            },
+        );
+        msg.insert("tool_calls".to_string(), Value::Array(tool_calls));
+        out.push(Value::Object(msg));
+    }
+}
+
 fn anthropic_to_openai(body: &Value) -> Value {
     let mut messages_out: Vec<Value> = Vec::new();
 
@@ -157,17 +259,21 @@ fn anthropic_to_openai(body: &Value) -> Value {
     if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
         for msg in messages {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-            let content = match msg.get("content") {
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Array(blocks)) => blocks
-                    .iter()
-                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(""),
-                _ => String::new(),
-            };
-            messages_out.push(json!({"role": role, "content": content}));
+            match msg.get("content") {
+                Some(Value::String(s)) => {
+                    messages_out.push(json!({"role": role, "content": s}));
+                }
+                Some(Value::Array(blocks)) => {
+                    if role == "assistant" {
+                        translate_assistant_content(blocks, &mut messages_out);
+                    } else {
+                        translate_user_content(blocks, &mut messages_out);
+                    }
+                }
+                _ => {
+                    messages_out.push(json!({"role": role, "content": ""}));
+                }
+            }
         }
     }
 
@@ -475,8 +581,9 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
         url, model, stream_requested
     );
     println!(
-        "[messages] translated body: {}",
-        openai_req.to_string().chars().take(500).collect::<String>()
+        "[messages] translated messages: {}",
+        serde_json::to_string(openai_req.get("messages").unwrap_or(&Value::Null))
+            .unwrap_or_else(|_| "<unserializable>".to_string())
     );
 
     let mut upstream_req = state.client.post(&url).json(&openai_req);
@@ -1171,7 +1278,7 @@ mod tests {
         assert_eq!(out["messages"][0]["role"], json!("system"));
         assert_eq!(out["messages"][0]["content"], json!("You are helpful."));
         assert_eq!(out["messages"][1]["role"], json!("user"));
-        assert_eq!(out["messages"][1]["content"], json!("hello world"));
+        assert_eq!(out["messages"][1]["content"], json!("hello \nworld"));
         assert_eq!(out["max_tokens"], json!(100));
     }
 
@@ -1272,6 +1379,140 @@ mod tests {
         let text = anthropic_full_text(&req);
         assert!(text.contains("Read"));
         assert!(text.contains("/x"));
+    }
+
+    #[test]
+    fn anthropic_to_openai_assistant_tool_use() {
+        let req = json!({
+            "model": "m",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "let me read"},
+                    {"type": "tool_use", "id": "toolu_abc", "name": "Read",
+                     "input": {"file": "/path"}}
+                ]
+            }]
+        });
+        let out = anthropic_to_openai(&req);
+        let msg = &out["messages"][0];
+        assert_eq!(msg["role"], json!("assistant"));
+        assert_eq!(msg["content"], json!("let me read"));
+        let tc = &msg["tool_calls"][0];
+        assert_eq!(tc["id"], json!("toolu_abc"));
+        assert_eq!(tc["type"], json!("function"));
+        assert_eq!(tc["function"]["name"], json!("Read"));
+        let args: Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({"file": "/path"}));
+    }
+
+    #[test]
+    fn anthropic_to_openai_assistant_tool_use_only() {
+        let req = json!({
+            "model": "m",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file": "/a"}}
+                ]
+            }]
+        });
+        let out = anthropic_to_openai(&req);
+        let msg = &out["messages"][0];
+        assert!(msg["content"].is_null());
+        assert_eq!(msg["tool_calls"][0]["function"]["name"], json!("Read"));
+    }
+
+    #[test]
+    fn anthropic_to_openai_user_tool_result_string() {
+        let req = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_abc",
+                     "content": "file contents here"}
+                ]
+            }]
+        });
+        let out = anthropic_to_openai(&req);
+        let msg = &out["messages"][0];
+        assert_eq!(msg["role"], json!("tool"));
+        assert_eq!(msg["tool_call_id"], json!("toolu_abc"));
+        assert_eq!(msg["content"], json!("file contents here"));
+    }
+
+    #[test]
+    fn anthropic_to_openai_user_tool_result_blocks() {
+        let req = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_abc", "content": [
+                        {"type": "text", "text": "line1"},
+                        {"type": "text", "text": "line2"}
+                    ]}
+                ]
+            }]
+        });
+        let out = anthropic_to_openai(&req);
+        let msg = &out["messages"][0];
+        assert_eq!(msg["role"], json!("tool"));
+        assert_eq!(msg["content"], json!("line1\nline2"));
+    }
+
+    #[test]
+    fn anthropic_to_openai_user_mixed_text_and_tool_results() {
+        let req = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "result1"},
+                    {"type": "tool_result", "tool_use_id": "toolu_2", "content": "result2"},
+                    {"type": "text", "text": "after"}
+                ]
+            }]
+        });
+        let out = anthropic_to_openai(&req);
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], json!("user"));
+        assert_eq!(msgs[0]["content"], json!("before"));
+        assert_eq!(msgs[1]["role"], json!("tool"));
+        assert_eq!(msgs[1]["tool_call_id"], json!("toolu_1"));
+        assert_eq!(msgs[1]["content"], json!("result1"));
+        assert_eq!(msgs[2]["role"], json!("tool"));
+        assert_eq!(msgs[2]["tool_call_id"], json!("toolu_2"));
+        assert_eq!(msgs[3]["role"], json!("user"));
+        assert_eq!(msgs[3]["content"], json!("after"));
+    }
+
+    #[test]
+    fn anthropic_to_openai_full_tool_roundtrip() {
+        let req = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "read /x please"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file": "/x"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "hello from x"}
+                ]}
+            ]
+        });
+        let out = anthropic_to_openai(&req);
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], json!("user"));
+        assert_eq!(msgs[1]["role"], json!("assistant"));
+        assert_eq!(msgs[1]["tool_calls"][0]["id"], json!("toolu_1"));
+        assert_eq!(msgs[2]["role"], json!("tool"));
+        assert_eq!(msgs[2]["tool_call_id"], json!("toolu_1"));
+        assert_eq!(msgs[2]["content"], json!("hello from x"));
     }
 
     #[test]
