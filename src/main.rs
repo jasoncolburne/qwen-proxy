@@ -161,7 +161,11 @@ fn translate_user_content(blocks: &[Value], out: &mut Vec<Value>) {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let content_text = match block.get("content") {
+                let is_error = block
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mut content_text = match block.get("content") {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Array(arr)) => arr
                         .iter()
@@ -176,6 +180,9 @@ fn translate_user_content(blocks: &[Value], out: &mut Vec<Value>) {
                         .join("\n"),
                     _ => String::new(),
                 };
+                if is_error {
+                    content_text = format!("Error: {}", content_text);
+                }
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
@@ -425,6 +432,25 @@ enum Segment {
     ToolCall { name: String, input: Value },
 }
 
+fn normalize_tool_name(name: &str) -> String {
+    match name.to_lowercase().as_str() {
+        "read" => "Read".to_string(),
+        "write" => "Write".to_string(),
+        "bash" => "Bash".to_string(),
+        "edit" => "Edit".to_string(),
+        "grep" => "Grep".to_string(),
+        "glob" => "Glob".to_string(),
+        "ls" => "LS".to_string(),
+        "task" => "Task".to_string(),
+        "webfetch" => "WebFetch".to_string(),
+        "websearch" => "WebSearch".to_string(),
+        "todowrite" => "TodoWrite".to_string(),
+        "notebookedit" => "NotebookEdit".to_string(),
+        "multiedit" => "MultiEdit".to_string(),
+        _ => name.to_string(),
+    }
+}
+
 fn parse_tool_call(body: &str) -> Option<(String, Value)> {
     let body = body.trim();
     let (name, mut rest) = match body.find(char::is_whitespace) {
@@ -589,13 +615,19 @@ fn parse_segments(full: &str) -> Vec<Segment> {
                     None => (after_open, ""),
                 };
                 if let Some((name, input)) = parse_tool_call(body) {
-                    out.push(Segment::ToolCall { name, input });
+                    out.push(Segment::ToolCall {
+                        name: normalize_tool_name(&name),
+                        input,
+                    });
                 }
                 remaining = next;
             }
             "bracket" => match parse_bracket_call(rest) {
                 Some((name, input, consumed)) => {
-                    out.push(Segment::ToolCall { name, input });
+                    out.push(Segment::ToolCall {
+                        name: normalize_tool_name(&name),
+                        input,
+                    });
                     remaining = &rest[consumed..];
                 }
                 None => {
@@ -1328,6 +1360,67 @@ mod tests {
             }
             _ => panic!("expected tool_call"),
         }
+    }
+
+    #[test]
+    fn normalize_tool_name_known() {
+        assert_eq!(normalize_tool_name("read"), "Read");
+        assert_eq!(normalize_tool_name("READ"), "Read");
+        assert_eq!(normalize_tool_name("Read"), "Read");
+        assert_eq!(normalize_tool_name("write"), "Write");
+        assert_eq!(normalize_tool_name("bash"), "Bash");
+        assert_eq!(normalize_tool_name("edit"), "Edit");
+        assert_eq!(normalize_tool_name("grep"), "Grep");
+        assert_eq!(normalize_tool_name("glob"), "Glob");
+        assert_eq!(normalize_tool_name("ls"), "LS");
+        assert_eq!(normalize_tool_name("webfetch"), "WebFetch");
+        assert_eq!(normalize_tool_name("todowrite"), "TodoWrite");
+    }
+
+    #[test]
+    fn normalize_tool_name_unknown_passthrough() {
+        assert_eq!(normalize_tool_name("MyCustomTool"), "MyCustomTool");
+        assert_eq!(normalize_tool_name("foo_bar"), "foo_bar");
+    }
+
+    #[test]
+    fn parse_segments_lowercase_bracket_normalized() {
+        let segs = parse_segments("[Calling tool: read({\"file_path\":\"/x\"})]");
+        match &segs[0] {
+            Segment::ToolCall { name, .. } => assert_eq!(name, "Read"),
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn parse_segments_lowercase_xml_normalized() {
+        let segs = parse_segments("<tool_call>\nwrite file=\"/a\" content=\"hi\"\n</tool_call>");
+        match &segs[0] {
+            Segment::ToolCall { name, .. } => assert_eq!(name, "Write"),
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn anthropic_to_openai_tool_result_error() {
+        let req = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1",
+                     "content": "No such tool available: read", "is_error": true}
+                ]
+            }]
+        });
+        let out = anthropic_to_openai(&req);
+        let msg = &out["messages"][0];
+        assert_eq!(msg["role"], json!("tool"));
+        assert_eq!(msg["tool_call_id"], json!("toolu_1"));
+        assert_eq!(
+            msg["content"],
+            json!("Error: No such tool available: read")
+        );
     }
 
     #[test]
