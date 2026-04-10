@@ -228,6 +228,26 @@ fn sse_event(event: &str, data: &Value) -> Bytes {
     Bytes::from(format!("event: {}\ndata: {}\n\n", event, data))
 }
 
+fn tokenize_len(tokenizer: &Tokenizer, text: &str) -> u64 {
+    tokenizer
+        .encode(text, false)
+        .map(|enc| enc.get_ids().len() as u64)
+        .unwrap_or(0)
+}
+
+fn openai_messages_text(openai_req: &Value) -> String {
+    let mut out = String::new();
+    if let Some(msgs) = openai_req.get("messages").and_then(|m| m.as_array()) {
+        for msg in msgs {
+            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                out.push_str(content);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 enum Segment {
     Text(String),
     ToolCall { name: String, input: Value },
@@ -375,6 +395,10 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
 
     let openai_req = anthropic_to_openai(&anthropic_req);
 
+    let input_text = openai_messages_text(&openai_req);
+    let input_tokens = tokenize_len(&state.tokenizer, &input_text);
+    println!("[messages] computed input_tokens: {}", input_tokens);
+
     let url = format!("{}/v1/chat/completions", state.upstream);
     println!(
         "[messages] translating -> {} (model={}, stream={})",
@@ -443,6 +467,8 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                 .unwrap_or(0)
         );
         let model_for_stream = model.clone();
+        let state_for_stream = state.clone();
+        let input_tokens_start = input_tokens;
         let mut upstream_stream = resp.bytes_stream();
 
         let translated = async_stream::stream! {
@@ -475,7 +501,7 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                     "model": model_for_stream,
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                    "usage": {"input_tokens": input_tokens_start, "output_tokens": 0}
                 }
             });
             emit!("message_start", &start);
@@ -484,8 +510,6 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
             let mut buf: Vec<u8> = Vec::new();
             let mut full_text = String::new();
             let mut stop_reason = "end_turn".to_string();
-            let mut output_tokens: u64 = 0;
-            let mut input_tokens: u64 = 0;
 
             'outer: while let Some(chunk) = upstream_stream.next().await {
                 let chunk = match chunk {
@@ -546,18 +570,6 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                                 {
                                     stop_reason = map_stop_reason(fr).to_string();
                                 }
-                            }
-                        }
-                        if let Some(usage) = json_val.get("usage") {
-                            if let Some(ct) =
-                                usage.get("completion_tokens").and_then(|v| v.as_u64())
-                            {
-                                output_tokens = ct;
-                            }
-                            if let Some(pt) =
-                                usage.get("prompt_tokens").and_then(|v| v.as_u64())
-                            {
-                                input_tokens = pt;
                             }
                         }
                     }
@@ -635,10 +647,13 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                 stop_reason = "tool_use".to_string();
             }
 
+            let output_tokens = tokenize_len(&state_for_stream.tokenizer, &full_text);
+            println!("[messages] computed output_tokens: {}", output_tokens);
+
             let msg_delta = json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+                "usage": {"input_tokens": input_tokens_start, "output_tokens": output_tokens}
             });
             emit!("message_delta", &msg_delta);
 
@@ -704,16 +719,7 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
             .and_then(|v| v.as_str())
             .map(|s| format!("msg_{}", s))
             .unwrap_or_else(|| "msg_unknown".to_string());
-        let input_tokens = openai_resp
-            .get("usage")
-            .and_then(|u| u.get("prompt_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let output_tokens = openai_resp
-            .get("usage")
-            .and_then(|u| u.get("completion_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let output_tokens = tokenize_len(&state.tokenizer, &text);
 
         let anthropic_resp = json!({
             "id": id,
@@ -1119,6 +1125,25 @@ mod tests {
         });
         let out = anthropic_to_openai(&req);
         assert_eq!(out["max_tokens"], json!(65536));
+    }
+
+    #[test]
+    fn openai_messages_text_joins_content() {
+        let req = json!({
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"}
+            ]
+        });
+        let text = openai_messages_text(&req);
+        assert_eq!(text, "sys\nhello\nhi\n");
+    }
+
+    #[test]
+    fn openai_messages_text_empty_when_no_messages() {
+        let req = json!({"model": "m"});
+        assert_eq!(openai_messages_text(&req), "");
     }
 
     #[test]
