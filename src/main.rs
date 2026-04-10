@@ -433,21 +433,10 @@ enum Segment {
 }
 
 fn normalize_tool_name(name: &str) -> String {
-    match name.to_lowercase().as_str() {
-        "read" => "Read".to_string(),
-        "write" => "Write".to_string(),
-        "bash" => "Bash".to_string(),
-        "edit" => "Edit".to_string(),
-        "grep" => "Grep".to_string(),
-        "glob" => "Glob".to_string(),
-        "ls" => "LS".to_string(),
-        "task" => "Task".to_string(),
-        "webfetch" => "WebFetch".to_string(),
-        "websearch" => "WebSearch".to_string(),
-        "todowrite" => "TodoWrite".to_string(),
-        "notebookedit" => "NotebookEdit".to_string(),
-        "multiedit" => "MultiEdit".to_string(),
-        _ => name.to_string(),
+    let mut chars = name.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
     }
 }
 
@@ -469,45 +458,66 @@ fn parse_tool_call(body: &str) -> Option<(String, Value)> {
         };
         let key = rest[..eq].trim().to_string();
         let after_eq = &rest[eq + 1..];
-        if !after_eq.starts_with('"') {
-            break;
-        }
-        let after_quote = &after_eq[1..];
 
-        let mut val = String::new();
-        let mut end_byte: Option<usize> = None;
-        let mut chars = after_quote.char_indices();
-        while let Some((i, c)) = chars.next() {
-            if c == '\\' {
-                if let Some((_, next)) = chars.next() {
-                    match next {
-                        'n' => val.push('\n'),
-                        't' => val.push('\t'),
-                        'r' => val.push('\r'),
-                        '"' => val.push('"'),
-                        '\\' => val.push('\\'),
-                        other => {
-                            val.push('\\');
-                            val.push(other);
+        if after_eq.starts_with('"') {
+            let after_quote = &after_eq[1..];
+            let mut val = String::new();
+            let mut end_byte: Option<usize> = None;
+            let mut chars = after_quote.char_indices();
+            while let Some((i, c)) = chars.next() {
+                if c == '\\' {
+                    if let Some((_, next)) = chars.next() {
+                        match next {
+                            'n' => val.push('\n'),
+                            't' => val.push('\t'),
+                            'r' => val.push('\r'),
+                            '"' => val.push('"'),
+                            '\\' => val.push('\\'),
+                            other => {
+                                val.push('\\');
+                                val.push(other);
+                            }
                         }
                     }
+                } else if c == '"' {
+                    end_byte = Some(i);
+                    break;
+                } else {
+                    val.push(c);
                 }
-            } else if c == '"' {
-                end_byte = Some(i);
-                break;
-            } else {
-                val.push(c);
             }
-        }
 
-        let end = match end_byte {
-            Some(e) => e,
-            None => break,
-        };
-        if !key.is_empty() {
-            input.insert(key, Value::String(val));
+            let end = match end_byte {
+                Some(e) => e,
+                None => break,
+            };
+            if !key.is_empty() {
+                input.insert(key, Value::String(val));
+            }
+            rest = after_quote[end + 1..].trim_start();
+        } else {
+            let end = after_eq
+                .find(char::is_whitespace)
+                .unwrap_or(after_eq.len());
+            let raw = after_eq[..end].trim_end_matches(|c: char| c == ',' || c == ';');
+            let parsed_value: Value = if let Ok(n) = raw.parse::<i64>() {
+                json!(n)
+            } else if let Ok(f) = raw.parse::<f64>() {
+                json!(f)
+            } else if raw == "true" {
+                json!(true)
+            } else if raw == "false" {
+                json!(false)
+            } else if raw == "null" {
+                Value::Null
+            } else {
+                Value::String(raw.to_string())
+            };
+            if !key.is_empty() {
+                input.insert(key, parsed_value);
+            }
+            rest = after_eq[end..].trim_start();
         }
-        rest = after_quote[end + 1..].trim_start();
     }
 
     Some((name, Value::Object(input)))
@@ -1363,24 +1373,45 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tool_name_known() {
+    fn normalize_tool_name_capitalizes_first_letter() {
         assert_eq!(normalize_tool_name("read"), "Read");
-        assert_eq!(normalize_tool_name("READ"), "Read");
         assert_eq!(normalize_tool_name("Read"), "Read");
         assert_eq!(normalize_tool_name("write"), "Write");
         assert_eq!(normalize_tool_name("bash"), "Bash");
-        assert_eq!(normalize_tool_name("edit"), "Edit");
-        assert_eq!(normalize_tool_name("grep"), "Grep");
-        assert_eq!(normalize_tool_name("glob"), "Glob");
-        assert_eq!(normalize_tool_name("ls"), "LS");
-        assert_eq!(normalize_tool_name("webfetch"), "WebFetch");
-        assert_eq!(normalize_tool_name("todowrite"), "TodoWrite");
+        assert_eq!(normalize_tool_name("MyCustomTool"), "MyCustomTool");
+        assert_eq!(normalize_tool_name(""), "");
     }
 
     #[test]
-    fn normalize_tool_name_unknown_passthrough() {
-        assert_eq!(normalize_tool_name("MyCustomTool"), "MyCustomTool");
-        assert_eq!(normalize_tool_name("foo_bar"), "foo_bar");
+    fn parse_tool_call_with_offset_limit() {
+        let (name, input) =
+            parse_tool_call("Read file=\"/path/to/file\" offset=100 limit=50").unwrap();
+        assert_eq!(name, "Read");
+        assert_eq!(input["file"], json!("/path/to/file"));
+        assert_eq!(input["offset"], json!(100));
+        assert_eq!(input["limit"], json!(50));
+    }
+
+    #[test]
+    fn parse_tool_call_bool_value() {
+        let (_, input) = parse_tool_call("Bash command=\"ls\" background=true").unwrap();
+        assert_eq!(input["background"], json!(true));
+    }
+
+    #[test]
+    fn parse_tool_call_float_value() {
+        let (_, input) = parse_tool_call("Foo timeout=1.5").unwrap();
+        assert_eq!(input["timeout"], json!(1.5));
+    }
+
+    #[test]
+    fn parse_bracket_call_preserves_offset_limit() {
+        let s = "[Calling tool: Read({\"file_path\":\"/path\",\"offset\":100,\"limit\":50})]";
+        let (name, input, _) = parse_bracket_call(s).unwrap();
+        assert_eq!(name, "Read");
+        assert_eq!(input["file_path"], json!("/path"));
+        assert_eq!(input["offset"], json!(100));
+        assert_eq!(input["limit"], json!(50));
     }
 
     #[test]
