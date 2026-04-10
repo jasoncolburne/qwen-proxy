@@ -228,10 +228,19 @@ fn sse_event(event: &str, data: &Value) -> Bytes {
 }
 
 async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
     let headers = req.headers().clone();
 
+    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    println!("[messages] {} {}", &method, path);
+    println!("[messages] request headers:");
+    for (k, v) in headers.iter() {
+        println!("  {}: {}", k, v.to_str().unwrap_or("<binary>"));
+    }
+
     if !check_auth(&headers, &state.api_key) {
-        println!("[messages] unauthorized");
+        println!("[messages] unauthorized request to {}", path);
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
@@ -242,9 +251,19 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
         }
     };
 
+    println!(
+        "[messages] request body ({} bytes): {}",
+        body_bytes.len(),
+        String::from_utf8_lossy(&body_bytes)
+            .chars()
+            .take(500)
+            .collect::<String>()
+    );
+
     let anthropic_req: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
+            println!("[messages] JSON parse error: {e}");
             return (StatusCode::BAD_REQUEST, format!("JSON parse error: {e}")).into_response();
         }
     };
@@ -263,8 +282,12 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
 
     let url = format!("{}/v1/chat/completions", state.upstream);
     println!(
-        "[messages] translating POST /v1/messages -> {} (stream={})",
-        url, stream_requested
+        "[messages] translating -> {} (model={}, stream={})",
+        url, model, stream_requested
+    );
+    println!(
+        "[messages] translated body: {}",
+        openai_req.to_string().chars().take(500).collect::<String>()
     );
 
     let mut upstream_req = state.client.post(&url).json(&openai_req);
@@ -286,27 +309,37 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
         upstream_req = upstream_req.header("authorization", format!("Bearer {}", upstream_key));
     }
 
+    println!("[messages] sending to upstream: {}", url);
     let resp = match upstream_req.send().await {
         Ok(r) => r,
         Err(e) => {
-            println!("[messages] upstream error: {e}");
+            println!("[messages] upstream request failed: {e}");
             return (StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")).into_response();
         }
     };
 
     let status = resp.status();
+    println!("[messages] upstream status: {}", status);
+    println!("[messages] upstream response headers:");
+    for (k, v) in resp.headers().iter() {
+        println!("  {}: {}", k, v.to_str().unwrap_or("<binary>"));
+    }
     if !status.is_success() {
         let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let bytes = resp.bytes().await.unwrap_or_default();
         println!(
             "[messages] upstream non-success {}: {}",
             status,
-            String::from_utf8_lossy(&bytes).chars().take(500).collect::<String>()
+            String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(500)
+                .collect::<String>()
         );
         return (code, bytes).into_response();
     }
 
     if stream_requested {
+        println!("[messages] piping translated SSE stream");
         let msg_id = format!(
             "msg_{}",
             std::time::SystemTime::now()
@@ -448,13 +481,23 @@ async fn messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Res
                     .unwrap()
             })
     } else {
+        println!("[messages] buffering non-streaming response");
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
+                println!("[messages] failed to read response body: {e}");
                 return (StatusCode::BAD_GATEWAY, format!("Upstream read error: {e}"))
                     .into_response();
             }
         };
+        println!(
+            "[messages] upstream response body ({} bytes): {}",
+            bytes.len(),
+            String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(500)
+                .collect::<String>()
+        );
         let openai_resp: Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(e) => {
