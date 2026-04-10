@@ -487,26 +487,124 @@ fn parse_tool_call(body: &str) -> Option<(String, Value)> {
     Some((name, Value::Object(input)))
 }
 
+/// Parses a `[Calling tool: NAME({...})]` block. Returns (name, input, bytes_consumed)
+/// where bytes_consumed is measured from the start of `s` (which must begin with the
+/// `[Calling tool:` marker).
+fn parse_bracket_call(s: &str) -> Option<(String, Value, usize)> {
+    const MARKER: &str = "[Calling tool:";
+    if !s.starts_with(MARKER) {
+        return None;
+    }
+    let after_marker = &s[MARKER.len()..];
+    let trimmed = after_marker.trim_start();
+    let leading_ws = after_marker.len() - trimmed.len();
+
+    let paren = trimmed.find('(')?;
+    let name = trimmed[..paren].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let after_paren = &trimmed[paren + 1..];
+
+    let bytes = after_paren.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut json_end: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    json_end = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let json_end = json_end?;
+    let json_str = &after_paren[..json_end];
+    let input: Value = serde_json::from_str(json_str)
+        .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+
+    let after_json = &after_paren[json_end..];
+    let closing = if after_json.starts_with(")]") {
+        2
+    } else if after_json.starts_with(')') {
+        1
+    } else {
+        0
+    };
+    let consumed = MARKER.len() + leading_ws + paren + 1 + json_end + closing;
+    Some((name, input, consumed))
+}
+
 fn parse_segments(full: &str) -> Vec<Segment> {
     let mut out = Vec::new();
     let mut remaining = full;
-    while let Some(start) = remaining.find("<tool_call>") {
+    loop {
+        let xml = remaining.find("<tool_call>");
+        let bracket = remaining.find("[Calling tool:");
+        let (kind, start) = match (xml, bracket) {
+            (None, None) => break,
+            (Some(a), None) => ("xml", a),
+            (None, Some(b)) => ("bracket", b),
+            (Some(a), Some(b)) => {
+                if a <= b {
+                    ("xml", a)
+                } else {
+                    ("bracket", b)
+                }
+            }
+        };
+
         let (before, rest) = remaining.split_at(start);
         if !before.is_empty() {
             out.push(Segment::Text(before.to_string()));
         }
-        let after_open = &rest["<tool_call>".len()..];
-        let (body, next) = match after_open.find("</tool_call>") {
-            Some(end) => (
-                &after_open[..end],
-                &after_open[end + "</tool_call>".len()..],
-            ),
-            None => (after_open, ""),
-        };
-        if let Some((name, input)) = parse_tool_call(body) {
-            out.push(Segment::ToolCall { name, input });
+
+        match kind {
+            "xml" => {
+                let after_open = &rest["<tool_call>".len()..];
+                let (body, next) = match after_open.find("</tool_call>") {
+                    Some(end) => (
+                        &after_open[..end],
+                        &after_open[end + "</tool_call>".len()..],
+                    ),
+                    None => (after_open, ""),
+                };
+                if let Some((name, input)) = parse_tool_call(body) {
+                    out.push(Segment::ToolCall { name, input });
+                }
+                remaining = next;
+            }
+            "bracket" => match parse_bracket_call(rest) {
+                Some((name, input, consumed)) => {
+                    out.push(Segment::ToolCall { name, input });
+                    remaining = &rest[consumed..];
+                }
+                None => {
+                    out.push(Segment::Text(rest.to_string()));
+                    return out;
+                }
+            },
+            _ => unreachable!(),
         }
-        remaining = next;
     }
     if !remaining.is_empty() {
         out.push(Segment::Text(remaining.to_string()));
@@ -1246,6 +1344,82 @@ mod tests {
             }
             _ => panic!("expected tool_call"),
         }
+    }
+
+    #[test]
+    fn parse_segments_bracket_format() {
+        let segs = parse_segments("[Calling tool: Read({\"file_path\":\"/x\"})]");
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            Segment::ToolCall { name, input } => {
+                assert_eq!(name, "Read");
+                assert_eq!(input["file_path"], json!("/x"));
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn parse_segments_bracket_with_surrounding_text() {
+        let segs = parse_segments("hello [Calling tool: Write({\"file\":\"/a\",\"content\":\"hi\"})] done");
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(&segs[0], Segment::Text(t) if t == "hello "));
+        match &segs[1] {
+            Segment::ToolCall { name, input } => {
+                assert_eq!(name, "Write");
+                assert_eq!(input["file"], json!("/a"));
+                assert_eq!(input["content"], json!("hi"));
+            }
+            _ => panic!("expected tool call"),
+        }
+        assert!(matches!(&segs[2], Segment::Text(t) if t == " done"));
+    }
+
+    #[test]
+    fn parse_segments_bracket_string_with_braces() {
+        let segs = parse_segments(
+            "[Calling tool: Write({\"file\":\"/a\",\"content\":\"hello {world}\"})]",
+        );
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            Segment::ToolCall { name, input } => {
+                assert_eq!(name, "Write");
+                assert_eq!(input["content"], json!("hello {world}"));
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn parse_segments_mixed_formats() {
+        let segs = parse_segments(
+            "<tool_call>Read file=\"/a\"</tool_call> then [Calling tool: Read({\"file_path\":\"/b\"})]",
+        );
+        assert_eq!(segs.len(), 3);
+        match &segs[0] {
+            Segment::ToolCall { name, input } => {
+                assert_eq!(name, "Read");
+                assert_eq!(input["file"], json!("/a"));
+            }
+            _ => panic!("expected first xml tool"),
+        }
+        assert!(matches!(&segs[1], Segment::Text(t) if t == " then "));
+        match &segs[2] {
+            Segment::ToolCall { name, input } => {
+                assert_eq!(name, "Read");
+                assert_eq!(input["file_path"], json!("/b"));
+            }
+            _ => panic!("expected second bracket tool"),
+        }
+    }
+
+    #[test]
+    fn parse_bracket_call_consumes_full_marker() {
+        let s = "[Calling tool: Read({\"file_path\":\"/x\"})]REST";
+        let (name, input, consumed) = parse_bracket_call(s).unwrap();
+        assert_eq!(name, "Read");
+        assert_eq!(input["file_path"], json!("/x"));
+        assert_eq!(&s[consumed..], "REST");
     }
 
     #[test]
