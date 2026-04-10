@@ -126,12 +126,8 @@ async fn proxy(
         uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
     );
 
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
-        Ok(b) => b,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("Failed to read body: {e}")).into_response()
-        }
-    };
+    let body_stream = req.into_body().into_data_stream();
+    let upstream_body = reqwest::Body::wrap_stream(body_stream);
 
     let mut upstream_req = state.client.request(method, &url);
     for (key, value) in headers.iter() {
@@ -140,25 +136,32 @@ async fn proxy(
         }
         upstream_req = upstream_req.header(key, value);
     }
-    upstream_req = upstream_req.body(body_bytes);
+    upstream_req = upstream_req.body(upstream_body);
 
     match upstream_req.send().await {
         Ok(resp) => {
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let resp_headers = resp.headers().clone();
-            let body = resp.bytes().await.unwrap_or_default();
 
             let mut response = Response::builder().status(status);
             for (key, value) in resp_headers.iter() {
+                // content-length is invalid once we stream; let the framework handle framing
+                if key == "content-length" || key == "transfer-encoding" {
+                    continue;
+                }
                 response = response.header(key, value);
             }
-            response.body(Body::from(body)).unwrap_or_else(|_| {
-                Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::empty())
-                    .unwrap()
-            })
+
+            let stream = resp.bytes_stream();
+            response
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .unwrap()
+                })
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")).into_response(),
     }
@@ -178,9 +181,18 @@ async fn main() {
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .unwrap_or_else(|e| panic!("Failed to load tokenizer from {tokenizer_path}: {e}"));
 
+    // No .timeout() call: reqwest treats absence as "no overall deadline",
+    // which is what we want for long-lived SSE streams.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+        .expect("Failed to build reqwest client");
+
     let state = Arc::new(AppState {
         tokenizer,
-        client: reqwest::Client::new(),
+        client,
         upstream,
     });
 
